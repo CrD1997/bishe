@@ -34,6 +34,168 @@ struct FaceObject
     float prob; //是人脸的可能性
 };
 
+//理想状态下，landmark在112*112图片中的位置
+float points_dst[5][2] = {
+        { 30.2946f + 8.0f, 51.6963f },
+        { 65.5318f + 8.0f, 51.5014f },
+        { 48.0252f + 8.0f, 71.7366f },
+        { 33.5493f + 8.0f, 92.3655f },
+        { 62.7299f + 8.0f, 92.2041f }
+};
+
+cv::Mat MeanAxis0(const cv::Mat & src) {
+    int num = src.rows;
+    int dim = src.cols;
+
+    // x1 y1
+    // x2 y2
+
+    cv::Mat output(1, dim, CV_32FC1);
+    for (int i = 0; i < dim; i++) {
+        float sum = 0;
+        for (int j = 0; j < num; j++) {
+            sum += src.at<float>(j, i);
+        }
+        output.at<float>(0, i) = sum / num;
+    }
+
+    return output;
+}
+
+cv::Mat ElementwiseMinus(const cv::Mat & A, const cv::Mat & B) {
+    cv::Mat output(A.rows, A.cols, A.type());
+    assert(B.cols == A.cols);
+    if (B.cols == A.cols) {
+        for (int i = 0; i < A.rows; i++) {
+            for (int j = 0; j < B.cols; j++) {
+                output.at<float>(i, j) = A.at<float>(i, j) - B.at<float>(0, j);
+            }
+        }
+    }
+
+    return output;
+}
+
+cv::Mat VarAxis0(const cv::Mat & src) {
+    cv::Mat temp_ = ElementwiseMinus(src, MeanAxis0(src));
+    cv::multiply(temp_, temp_, temp_);
+    return MeanAxis0(temp_);
+}
+
+int MatrixRank(cv::Mat M) {
+    cv::Mat w, u, vt;
+    cv::SVD::compute(M, w, u, vt);
+    cv::Mat1b nonZeroSingularValues = w > 0.0001;
+    int rank = countNonZero(nonZeroSingularValues);
+    return rank;
+}
+
+cv::Mat SimilarTransform(const cv::Mat & src, const cv::Mat & dst) {
+    int num = src.rows;
+    int dim = src.cols;
+    cv::Mat src_mean = MeanAxis0(src);
+    cv::Mat dst_mean = MeanAxis0(dst);
+    cv::Mat src_demean = ElementwiseMinus(src, src_mean);
+    cv::Mat dst_demean = ElementwiseMinus(dst, dst_mean);
+    cv::Mat A = (dst_demean.t() * src_demean) / static_cast<float>(num);
+    cv::Mat d(dim, 1, CV_32F);
+    d.setTo(1.0f);
+    if (cv::determinant(A) < 0) {
+        d.at<float>(dim - 1, 0) = -1;
+
+    }
+    cv::Mat T = cv::Mat::eye(dim + 1, dim + 1, CV_32F);
+    cv::Mat U, S, V;
+    cv::SVD::compute(A, S, U, V);
+
+    // the SVD function in opencv differ from scipy .
+
+    int rank = MatrixRank(A);
+    if (rank == 0) {
+        assert(rank == 0);
+
+    }
+    else if (rank == dim - 1) {
+        if (cv::determinant(U) * cv::determinant(V) > 0) {
+            T.rowRange(0, dim).colRange(0, dim) = U * V;
+        }
+        else {
+            int s = d.at<float>(dim - 1, 0) = -1;
+            d.at<float>(dim - 1, 0) = -1;
+
+            T.rowRange(0, dim).colRange(0, dim) = U * V;
+            cv::Mat diag_ = cv::Mat::diag(d);
+            cv::Mat twp = diag_ * V; //np.dot(np.diag(d), V.T)
+            cv::Mat B = cv::Mat::zeros(3, 3, CV_8UC1);
+            cv::Mat C = B.diag(0);
+            T.rowRange(0, dim).colRange(0, dim) = U * twp;
+            d.at<float>(dim - 1, 0) = s;
+        }
+    }
+    else {
+        cv::Mat diag_ = cv::Mat::diag(d);
+        cv::Mat twp = diag_ * V.t(); //np.dot(np.diag(d), V.T)
+        cv::Mat res = U * twp; // U
+        T.rowRange(0, dim).colRange(0, dim) = -U.t()* twp;
+    }
+    cv::Mat var_ = VarAxis0(src_demean);
+    float val = cv::sum(var_).val[0];
+    cv::Mat res;
+    cv::multiply(d, S, res);
+    float scale = 1.0 / val * cv::sum(res).val[0];
+    T.rowRange(0, dim).colRange(0, dim) = -T.rowRange(0, dim).colRange(0, dim).t();
+    cv::Mat  temp1 = T.rowRange(0, dim).colRange(0, dim); // T[:dim, :dim]
+    cv::Mat  temp2 = src_mean.t();
+    cv::Mat  temp3 = temp1 * temp2;
+    cv::Mat temp4 = scale * temp3;
+    T.rowRange(0, dim).colRange(dim, dim + 1) = -(temp4 - dst_mean.t());
+    T.rowRange(0, dim).colRange(0, dim) *= scale;
+    return T;
+}
+
+int align_face(const cv::Mat& bgr, const FaceObject& faceobject, cv::Mat * face_aligned) {
+
+    std::cout << "start align face..." << std::endl;
+
+    float points_src[5][2] = {
+            {faceobject.landmark[0].x, faceobject.landmark[0].y},
+            {faceobject.landmark[1].x, faceobject.landmark[1].y},
+            {faceobject.landmark[2].x, faceobject.landmark[2].y},
+            {faceobject.landmark[3].x, faceobject.landmark[3].y},
+            {faceobject.landmark[4].x, faceobject.landmark[4].y}
+    };
+
+    cv::Mat src_mat(5, 2, CV_32FC1, points_src);
+    cv::Mat dst_mat(5, 2, CV_32FC1, points_dst);
+
+    cv::Mat transform = SimilarTransform(src_mat, dst_mat);
+
+    face_aligned->create(112, 112, CV_32FC3);
+
+    cv::Mat transfer_mat = transform(cv::Rect(0, 0, 3, 2));
+    cv::warpAffine(bgr.clone(), *face_aligned, transfer_mat, cv::Size(112, 112), 1, 0, 0);
+
+    std::cout << "end align face." << std::endl;
+    return 0;
+}
+
+void get_alignedfaces(const cv::Mat& bgr, const std::vector<FaceObject>& faceobjects){
+
+    cv::Mat image = bgr.clone();
+
+    for (size_t i = 0; i < faceobjects.size(); i++) {
+        const FaceObject &obj = faceobjects[i];
+
+        cv::Mat face_aligned;
+        align_face(image, obj, &face_aligned);
+        char filename[30];
+        sprintf(filename,"aligned/fp32/face_%d.jpg",i);
+        cv::imwrite(filename, face_aligned);
+    }
+
+//    cv::waitKey(0);
+}
+
 void print_mat(const ncnn::Mat& m)
 {
     for (int q=0; q<m.c; q++)
@@ -218,6 +380,7 @@ static void generate_proposals(const ncnn::Mat& anchors, int feat_stride, const 
                     float dw = bbox.channel(2)[index];
                     float dh = bbox.channel(3)[index];
 
+                    //获取anchor中心点坐标
                     float cx = anchor_x + anchor_w * 0.5f;
                     float cy = anchor_y + anchor_h * 0.5f;
 
@@ -265,8 +428,9 @@ static void generate_proposals(const ncnn::Mat& anchors, int feat_stride, const 
 static int detect_retinaface(ncnn::Net &retinaface, const cv::Mat& bgr, std::vector<FaceObject>& faceobjects)
 {
 
-    const float prob_threshold = 0.01f; //0.8
+    const float prob_threshold = 0.6f; //0.8，分类概率的阈值，超过这个阈值的检测被判定为正例
     // NMS: non maximum suppression，非极大值抑制，作用：去掉detection任务重复的检测框
+    //非极大值抑制中的IOU阈值，即在nms中与正例的IOU超过这个阈值的检测将被舍弃
     const float nms_threshold = 0.4f; //0.4
 
     //实例化Mat，第一个参数是data，后面是w、h
@@ -276,7 +440,7 @@ static int detect_retinaface(ncnn::Net &retinaface, const cv::Mat& bgr, std::vec
 
     //实例化Extractor
     ncnn::Extractor ex = retinaface.create_extractor();
-    ex.set_num_threads(1);
+    ex.set_num_threads(4);
     //设置输入，这里“data”是deploy中的数据层名字
     clock_t start_time = clock();
     ex.input("data", in);
@@ -291,12 +455,13 @@ static int detect_retinaface(ncnn::Net &retinaface, const cv::Mat& bgr, std::vec
         ex.extract("face_rpn_landmark_pred_stride32", landmark_blob);
 
         const int base_size = 16;
-        const int feat_stride = 32;
+        const int feat_stride = 32;//感受野大小，越来越小
         ncnn::Mat ratios(1);
         ratios[0] = 1.f;
         ncnn::Mat scales(2);
         scales[0] = 32.f;
         scales[1] = 16.f;
+        //获得2个anchors的坐标，[x_left_up, y_left_up, x_right_down, y_right_down]
         ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
 
         std::vector<FaceObject> faceobjects32;
@@ -435,31 +600,6 @@ static void draw_faceobjects(const cv::Mat& bgr, const std::vector<FaceObject>& 
     cv::waitKey(0);
 }
 
-static void save_faceobjects(const cv::Mat& bgr, const std::vector<FaceObject>& faceobjects)
-{
-    cv::Mat image = bgr.clone();
-
-    for (size_t i = 0; i < faceobjects.size(); i++)
-    {
-        const FaceObject& obj = faceobjects[i];
-
-        fprintf(stderr, "%.5f at %.2f %.2f %.2f x %.2f\n", obj.prob,
-                obj.rect.x, obj.rect.y, obj.rect.width, obj.rect.height);
-
-        //保存人脸矩形框
-        cv::Rect face_box = cv::Rect(obj.rect.x, obj.rect.y, obj.rect.width, obj.rect.height);
-        cv::Mat facebox_img = image(face_box);
-        cv::Mat face_112_112 = cv::Mat::zeros(112, 112, CV_8UC3); //转化为112*112大小的
-        resize(facebox_img, face_112_112, face_112_112.size());
-        char filename[8];
-        sprintf(filename,"face%d.jpg",i);
-        cv::imwrite(filename,face_112_112);
-    }
-
-    cv::imshow("image", image);
-    cv::waitKey(0);
-}
-
 int detect_on_fddb(){
 
     std::string fddbpath = "./FDDB-folds/";
@@ -471,8 +611,8 @@ int detect_on_fddb(){
     std::string out_file;
 
     ncnn::Net retinaface;
-    retinaface.load_param("models/retinaface-mnet0.25.param");
-    retinaface.load_model("models/retinaface-mnet0.25.bin");
+    retinaface.load_param("models/retinaface-mnet0.25-fp32-int8-n1.0.param");
+    retinaface.load_model("models/retinaface-mnet0.25-int8-n1.0.bin");
 
     for(int i=1; i<=10; i++){
         //读取FDDB中filepath文件
@@ -529,8 +669,8 @@ int detect_on_fddb(){
 
 int test_detect(){
 
-    const char* imagepath = "images/8_Election_Campain_Election_Campaign_8_1.jpg";
-    std::string model = "fp32";
+    const char* imagepath = "images/img_1194.jpg";
+    std::string model = "int8";
 
     //实例化ncnn::Net
     ncnn::Net retinaface;
@@ -559,6 +699,7 @@ int test_detect(){
         detect_retinaface(retinaface, m, faceobjects);
     }
 
+    get_alignedfaces(m, faceobjects);
     draw_faceobjects(m, faceobjects);
 
     return 0;
@@ -574,8 +715,8 @@ int main(int argc, char** argv){
 //    const char* imagepath = argv[1];
 //    std::string model = argv[2];
 
-//    test_detect();
-    detect_on_fddb();
+    test_detect();
+//    detect_on_fddb();
 
     return 0;
 }
